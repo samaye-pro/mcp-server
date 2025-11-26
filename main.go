@@ -1,109 +1,239 @@
+// main.go
 package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
+	"time"
+
+	"github.com/gorilla/websocket"
 )
 
-// ----------------- MCP Protocol Structs -----------------
-
+// ---------- MCP message structs ----------
 type MCPRequest struct {
 	ID     string                 `json:"id"`
 	Method string                 `json:"method"`
-	Params map[string]interface{} `json:"params"`
+	Params map[string]interface{} `json:"params,omitempty"`
 }
 
 type MCPResponse struct {
-	ID     string      `json:"id"`
-	Result interface{} `json:"result,omitempty"`
-	Error  interface{} `json:"error,omitempty"`
+	ID     string                 `json:"id"`
+	Method string                 `json:"method,omitempty"`
+	Result map[string]interface{} `json:"result,omitempty"`
+	Error  map[string]interface{} `json:"error,omitempty"`
 }
 
 type Ticket struct {
-	ID     int    `json:"id"`
+	ID     string `json:"id"`
 	Title  string `json:"title"`
 	Status string `json:"status"` // pending | todo | done
 }
 
-// ---------------- Dummy Data ----------------
-
+// ---------- Dummy ticket store ----------
 var tickets = []Ticket{
-	{ID: 1, Title: "Fix login bug", Status: "pending"},
-	{ID: 2, Title: "Add chat feature", Status: "todo"},
-	{ID: 3, Title: "Improve UI", Status: "done"},
-	{ID: 4, Title: "Email template update", Status: "pending"},
-	{ID: 5, Title: "Refactor API", Status: "done"},
+	{ID: "T1", Title: "Fix login bug", Status: "pending"},
+	{ID: "T2", Title: "Database indexing", Status: "pending"},
+	{ID: "T10", Title: "Payment integration", Status: "done"},
+	{ID: "T11", Title: "Email system", Status: "done"},
+	{ID: "T20", Title: "Create dashboard UI", Status: "todo"},
+	{ID: "T21", Title: "Add search filter", Status: "todo"},
 }
 
-// ---------------- Ticket Tools ----------------
-
-func getTicketsByStatus(status string) []Ticket {
-	var result []Ticket
+// ---------- helpers ----------
+func ticketsByStatus(status string) []Ticket {
+	out := make([]Ticket, 0)
 	for _, t := range tickets {
 		if t.Status == status {
-			result = append(result, t)
+			out = append(out, t)
 		}
 	}
-	return result
+	return out
 }
 
-// ---------------- MCP Handler ----------------
+func writeJSONConn(conn *websocket.Conn, v interface{}) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	return conn.WriteMessage(websocket.TextMessage, b)
+}
 
-func mcpHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
+// ---------- WebSocket handler ----------
+var upgrader = websocket.Upgrader{
+	// Allow all origins for testing / demo purposes.
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+func wsHandler(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("upgrade failed: %v\n", err)
 		return
 	}
+	defer conn.Close()
 
-	var req MCPRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, req.ID, "invalid_json", err.Error())
-		return
-	}
+	clientAddr := conn.RemoteAddr().String()
+	log.Printf("client connected: %s\n", clientAddr)
 
-	switch req.Method {
+	// loop read messages
+	for {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				log.Printf("client disconnected: %s\n", clientAddr)
+			} else {
+				log.Printf("read error: %v\n", err)
+			}
+			return
+		}
 
-	case "tool/get_pending_tickets":
-		writeResponse(w, req.ID, getTicketsByStatus("pending"))
+		var req MCPRequest
+		if err := json.Unmarshal(msg, &req); err != nil {
+			log.Printf("invalid json from %s: %v\n", clientAddr, err)
+			// reply with error
+			_ = writeJSONConn(conn, MCPResponse{
+				ID: req.ID,
+				Error: map[string]interface{}{
+					"code":    "INVALID_JSON",
+					"message": err.Error(),
+				},
+			})
+			continue
+		}
 
-	case "tool/get_done_tickets":
-		writeResponse(w, req.ID, getTicketsByStatus("done"))
+		log.Printf("recv from %s: method=%s id=%s params=%v\n", clientAddr, req.Method, req.ID, req.Params)
 
-	case "tool/get_todo_tickets":
-		writeResponse(w, req.ID, getTicketsByStatus("todo"))
+		switch req.Method {
+		case "initialize":
+			// reply with initialized and tools
+			result := map[string]interface{}{
+				"status": "initialized",
+				"server": "go-mcp-tickets",
+				"tools": []map[string]interface{}{
+					{"name": "get_pending_tickets", "description": "Get pending tickets"},
+					{"name": "get_done_tickets", "description": "Get done tickets"},
+					{"name": "get_todo_tickets", "description": "Get todo tickets"},
+				},
+			}
+			resp := MCPResponse{
+				ID:     req.ID,
+				Method: "initialized",
+				Result: result,
+			}
+			if err := writeJSONConn(conn, resp); err != nil {
+				log.Printf("write error: %v\n", err)
+				return
+			}
 
-	default:
-		writeError(w, req.ID, "unknown_method", "Method not supported")
+		case "tools/call":
+			// params should include { "name": "<toolName>", "arguments": {...} }
+			nameAny, ok := req.Params["name"]
+			if !ok {
+				_ = writeJSONConn(conn, MCPResponse{
+					ID: req.ID,
+					Error: map[string]interface{}{
+						"code":    "MISSING_TOOL_NAME",
+						"message": "params.name is required",
+					},
+				})
+				continue
+			}
+			toolName, _ := nameAny.(string)
+			// optional arguments
+			var args map[string]interface{}
+			if a, ok := req.Params["arguments"]; ok {
+				if m, ok := a.(map[string]interface{}); ok {
+					args = m
+				}
+			}
+
+			// Execute tool
+			switch toolName {
+			case "get_pending_tickets":
+				resp := MCPResponse{
+					ID: req.ID,
+					Result: map[string]interface{}{
+						"tickets": ticketsByStatus("pending"),
+						"meta": map[string]interface{}{
+							"count": len(ticketsByStatus("pending")),
+							"args":  args,
+						},
+					},
+				}
+				if err := writeJSONConn(conn, resp); err != nil {
+					log.Printf("write error: %v\n", err)
+					return
+				}
+
+			case "get_done_tickets":
+				resp := MCPResponse{
+					ID: req.ID,
+					Result: map[string]interface{}{
+						"tickets": ticketsByStatus("done"),
+						"meta": map[string]interface{}{
+							"count": len(ticketsByStatus("done")),
+							"args":  args,
+						},
+					},
+				}
+				if err := writeJSONConn(conn, resp); err != nil {
+					log.Printf("write error: %v\n", err)
+					return
+				}
+
+			case "get_todo_tickets":
+				resp := MCPResponse{
+					ID: req.ID,
+					Result: map[string]interface{}{
+						"tickets": ticketsByStatus("todo"),
+						"meta": map[string]interface{}{
+							"count": len(ticketsByStatus("todo")),
+							"args":  args,
+						},
+					},
+				}
+				if err := writeJSONConn(conn, resp); err != nil {
+					log.Printf("write error: %v\n", err)
+					return
+				}
+
+			default:
+				_ = writeJSONConn(conn, MCPResponse{
+					ID: req.ID,
+					Error: map[string]interface{}{
+						"code":    "TOOL_NOT_FOUND",
+						"message": fmt.Sprintf("Unknown tool: %s", toolName),
+					},
+				})
+			}
+
+		case "ping":
+			_ = writeJSONConn(conn, MCPResponse{
+				ID: req.ID,
+				Result: map[string]interface{}{
+					"pong": time.Now().UTC().Format(time.RFC3339),
+				},
+			})
+
+		default:
+			_ = writeJSONConn(conn, MCPResponse{
+				ID: req.ID,
+				Error: map[string]interface{}{
+					"code":    "UNKNOWN_METHOD",
+					"message": fmt.Sprintf("Method not supported: %s", req.Method),
+				},
+			})
+		}
 	}
 }
-
-func writeResponse(w http.ResponseWriter, id string, result interface{}) {
-	resp := MCPResponse{
-		ID:     id,
-		Result: result,
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
-}
-
-func writeError(w http.ResponseWriter, id string, code string, message string) {
-	resp := MCPResponse{
-		ID: id,
-		Error: map[string]string{
-			"code":    code,
-			"message": message,
-		},
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
-}
-
-// ---------------- Main ----------------
 
 func main() {
-	http.HandleFunc("/mcp", mcpHandler)
+	http.HandleFunc("/ws", wsHandler)
 
-	log.Println("MCP Ticket Server running on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Println("MCP WebSocket Ticket Server running on :8080/ws (bind 0.0.0.0:8080)")
+	if err := http.ListenAndServe("0.0.0.0:8080", nil); err != nil {
+		log.Fatalf("server failed: %v\n", err)
+	}
 }
